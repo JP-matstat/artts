@@ -1,42 +1,22 @@
 #!/usr/bin/env python3
 """
 artts — Article-to-Speech pipeline
-───────────────────────────────────
-Reads articles through a local LLM (Ollama) + TTS (edge-tts) → MP3.
+Reads articles through a local LLM (Ollama) + TTS (edge-tts) -> MP3.
 
 Commands:
   setup                 Install Ollama, pull model, install Python deps
-  read [input]          Article → LLM rewrite → TTS → MP3
+  read [input]          Article -> LLM rewrite -> TTS -> MP3
   voices                List edge-tts voices
   models                List installed Ollama models
-
-Options for 'read':
-  -m, --model NAME      LLM model (default: qwen2.5:1.5b)
-  -v, --voice NAME      TTS voice (default: en-US-JennyNeural)
-  -o, --output FILE     Output MP3 path
-  -p, --prompt TEXT     Custom LLM instruction
-  -d, --direct          Skip LLM, TTS only
-
-Input sources:
-  artts read file.txt
-  artts read https://...
-  cat article | artts read
-  artts read -          (explicit stdin)
-
-Examples:
-  artts setup
-  artts read article.txt
-  artts read -m llama3.2:1b -o podcast.mp3 https://example.com/post
 """
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
-import sys, os, json, urllib.request, subprocess, re, asyncio, time, textwrap
+import sys, os, json, urllib.request, subprocess, re, asyncio, time
 from pathlib import Path
 from html.parser import HTMLParser
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-
+# Config
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 CONFIG_DIR = Path.home() / ".config" / "artts"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -45,11 +25,12 @@ DEFAULTS = {
     "llm": "qwen2.5:1.5b",
     "voice": "en-US-JennyNeural",
     "prompt": "Rewrite the following text as a natural, conversational audio script meant to be read aloud. Use clear, flowing language. Avoid markdown, bullet points, formatting symbols, or anything that doesn't read well. Keep it engaging and easy to follow by ear.",
-    "speed": 1.0,
 }
 
-# ─── HTML -> text (fallback) ─────────────────────────────────────────────────
+# User-Agent that looks like a real browser
+_UA = "Mozilla/5.0 (Linux; Android 15; Samsung Galaxy S25) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
 
+# HTML -> text fallback
 class _Strip(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -65,8 +46,7 @@ class _Strip(HTMLParser):
 def _strip_html(html):
     s = _Strip(); s.feed(html); return "".join(s.out)
 
-# ─── Article extraction (trafilatura) ────────────────────────────────────────
-
+# Article extraction (trafilatura, with fallback)
 _HAS_TRAFILATURA = False
 try:
     import trafilatura
@@ -76,17 +56,24 @@ except ImportError:
 
 def _extract_article(url):
     if _HAS_TRAFILATURA:
-        downloaded = trafilatura.fetch_url(url)
-        if downloaded:
-            text = trafilatura.extract(downloaded, output_format="txt",
-                                       include_links=False, include_images=False,
-                                       include_tables=False, include_formatting=False)
-            if text and len(text.strip()) > 100:
-                return text.strip()
+        try:
+            downloaded = trafilatura.fetch_url(url)
+            if downloaded:
+                text = trafilatura.extract(downloaded, output_format="txt",
+                    include_links=False, include_images=False,
+                    include_tables=False, include_formatting=False)
+                if text and len(text.strip()) > 100:
+                    return text.strip()
+        except Exception:
+            pass
     return None
 
-# ─── Shell helpers ───────────────────────────────────────────────────────────
+def _fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8","replace"), r.headers.get("Content-Type","")
 
+# Shell helpers
 def sh(cmd):
     print(f"  $ {cmd}", file=sys.stderr)
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -96,11 +83,11 @@ def sh(cmd):
 def tip(msg):
     print(f"  {msg}", file=sys.stderr)
 
-# ─── Ollama ──────────────────────────────────────────────────────────────────
-
+# Ollama
 def _ollama_alive():
     try:
-        urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=2)
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags", headers={"User-Agent": _UA})
+        urllib.request.urlopen(req, timeout=2)
         return True
     except Exception:
         return False
@@ -117,7 +104,8 @@ def _ollama_start():
 def _ollama_req(method, path, data=None):
     url = f"{OLLAMA_HOST}/api/{path}"
     body = json.dumps(data).encode() if data else None
-    r = urllib.request.Request(url, data=body, method=method, headers={"Content-Type":"application/json"})
+    r = urllib.request.Request(url, data=body, method=method,
+        headers={"Content-Type":"application/json", "User-Agent": _UA})
     with urllib.request.urlopen(r) as resp:
         return json.loads(resp.read())
 
@@ -134,8 +122,7 @@ def ollama_pull(name):
     _ollama_req("POST", "pull", {"name":name})
     tip("OK")
 
-# ─── TTS ─────────────────────────────────────────────────────────────────────
-
+# TTS
 def _check_edge():
     try:
         import edge_tts
@@ -156,8 +143,7 @@ async def _list_voices():
     for v in sorted(await edge_tts.list_voices(), key=lambda x: x["ShortName"]):
         print(f"{v['ShortName']:40s} {v['Gender']:6s} {v['Locale']}")
 
-# ─── Input reading ───────────────────────────────────────────────────────────
-
+# Input reading
 def read_source(src):
     if src.startswith(("http://","https://")):
         tip(f"Fetching {src} ...")
@@ -165,10 +151,13 @@ def read_source(src):
         if text:
             tip(f"  extracted {len(text)} chars of article text")
             return text
-        tip("  trafilatura failed, falling back to raw HTML strip")
-        with urllib.request.urlopen(src, timeout=30) as r:
-            data = r.read().decode("utf-8","replace")
-        ct = r.headers.get("Content-Type","")
+        tip("  article extraction failed, falling back to raw HTML strip")
+        try:
+            data, ct = _fetch(src)
+        except urllib.error.HTTPError as e:
+            print(f"HTTP error {e.code}: {e.reason}", file=sys.stderr)
+            print("Try saving the article to a .txt file and using: artts read file.txt", file=sys.stderr)
+            sys.exit(1)
         if "html" in ct or "html" in data[:500].lower():
             return _strip_html(data)
         return data
@@ -177,147 +166,92 @@ def read_source(src):
         print(f"File not found: {src}", file=sys.stderr); sys.exit(1)
     return p.read_text("utf-8","replace")
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
-
+# Commands
 def cmd_setup(args):
     tip("Setting up artts ...")
-
-    # 1. Ollama
     if sh("which ollama").returncode:
         tip("Installing Ollama ...")
         sh("pkg install tur-repo -y")
         sh("pkg install ollama -y")
     else:
         tip("Ollama already installed")
-
     if not _ollama_alive(): _ollama_start()
-
-    # 2. Pull LLM model(s)
     models = args.models or [DEFAULTS["llm"]]
-    installed = ollama_models()
     for m in models:
-        if m not in installed:
+        if m not in ollama_models():
             ollama_pull(m)
         else:
             tip(f"{m} already pulled")
-
-    # 3. Python packages
     tip("Installing Python packages (edge-tts, trafilatura) ...")
     sh("pip install edge-tts trafilatura")
-
-    # 4. Save config
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cfg = dict(DEFAULTS)
     if args.default_llm: cfg["llm"] = args.default_llm
     if args.default_voice: cfg["voice"] = args.default_voice
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-
-    tip("")
     tip("Setup complete!")
-    tip(f"   LLM  : {cfg['llm']}")
-    tip(f"   Voice: {cfg['voice']}")
-    tip("")
-    tip("Try:  artts read article.txt")
-    tip("      artts read https://example.com/article")
-    tip("      cat article.txt | artts read")
 
 def cmd_read(args):
     cfg = dict(DEFAULTS)
     if CONFIG_FILE.exists():
         cfg.update(json.loads(CONFIG_FILE.read_text()))
-
     model = args.model or cfg["llm"]
     voice = args.voice or cfg["voice"]
     prompt_tpl = args.prompt or cfg["prompt"]
     output = args.output
-
-    # Input
     if args.input:
         if args.input.startswith(("http://","https://")):
             text = read_source(args.input)
             stem = re.sub(r"[^a-zA-Z0-9]+","_", args.input.split("/")[-1].split(".")[0] or "article")
         elif args.input == "-":
-            text = sys.stdin.read()
-            stem = "stdin"
+            text = sys.stdin.read(); stem = "stdin"
         else:
-            text = read_source(args.input)
-            stem = Path(args.input).stem
+            text = read_source(args.input); stem = Path(args.input).stem
     else:
-        text = sys.stdin.read()
-        stem = "stdin"
-
+        text = sys.stdin.read(); stem = "stdin"
     if not text.strip():
         print("No input text", file=sys.stderr); sys.exit(1)
-
-    if not output:
-        output = f"{stem}.mp3"
-
+    if not output: output = f"{stem}.mp3"
     tip(f"Input: {len(text)} chars")
-
-    # Step 1 - LLM
     if not args.direct:
         if not _ollama_alive(): _ollama_start()
         tip(f"LLM ({model}) rewriting for speech ...")
-        if len(text) > 12000:
-            text = text[:12000] + "\n\n[... truncated ...]"
+        if len(text) > 12000: text = text[:12000] + "\n\n[... truncated ...]"
         tts_text = ollama_call(model, f"{prompt_tpl}\n\n---\n\n{text}")
         tip(f"   -> {len(tts_text)} chars")
     else:
         tts_text = text
-
-    # Step 2 - TTS
     if not _check_edge():
-        print("edge-tts not installed - run 'artts setup' first", file=sys.stderr)
-        sys.exit(1)
+        print("edge-tts not installed - run 'artts setup' first", file=sys.stderr); sys.exit(1)
     tip(f"TTS ({voice}) -> {output} ...")
     do_tts(tts_text, voice, output)
     sz = Path(output).stat().st_size
-    tip(f"Saved: {output}  ({sz/1024:.0f} KB, {sz/1024/16:.1f} min approx)")
+    tip(f"Saved: {output} ({sz/1024:.0f} KB, ~{sz/1024/16:.1f} min)")
 
 def cmd_voices():
-    if not _check_edge():
-        print("edge-tts not installed - run 'artts setup' first", file=sys.stderr)
-        sys.exit(1)
+    if not _check_edge(): print("edge-tts not installed - run 'artts setup' first", file=sys.stderr); sys.exit(1)
     asyncio.run(_list_voices())
 
 def cmd_models():
     if not _ollama_alive(): _ollama_start()
-    for m in ollama_models():
-        print(m)
-
-# --- CLI -------------------------------------------------------------------
+    for m in ollama_models(): print(m)
 
 def main():
     import argparse
     p = argparse.ArgumentParser(prog="artts", description="Article -> LLM -> TTS -> MP3")
-    p.add_argument("command", nargs="?", default="read",
-                   choices=["setup","read","voices","models"],
-                   help="setup | read [input] | voices | models")
-
+    p.add_argument("command", nargs="?", default="read", choices=["setup","read","voices","models"])
     args, rest = p.parse_known_args()
-
     if args.command == "setup":
         sp = argparse.ArgumentParser()
-        sp.add_argument("--models", nargs="*")
-        sp.add_argument("--default-llm")
-        sp.add_argument("--default-voice")
+        sp.add_argument("--models", nargs="*"); sp.add_argument("--default-llm"); sp.add_argument("--default-voice")
         cmd_setup(sp.parse_args(rest))
-
     elif args.command == "read":
         sp = argparse.ArgumentParser()
-        sp.add_argument("input", nargs="?")
-        sp.add_argument("-m","--model")
-        sp.add_argument("-v","--voice")
-        sp.add_argument("-o","--output")
-        sp.add_argument("-p","--prompt")
-        sp.add_argument("-d","--direct", action="store_true")
+        sp.add_argument("input", nargs="?"); sp.add_argument("-m","--model"); sp.add_argument("-v","--voice")
+        sp.add_argument("-o","--output"); sp.add_argument("-p","--prompt"); sp.add_argument("-d","--direct", action="store_true")
         cmd_read(sp.parse_args(rest))
-
-    elif args.command == "voices":
-        cmd_voices()
-
-    elif args.command == "models":
-        cmd_models()
+    elif args.command == "voices": cmd_voices()
+    elif args.command == "models": cmd_models()
 
 if __name__ == "__main__":
     main()
